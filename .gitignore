@@ -3,3 +3,5 @@ HIDE
 
 *.iso
 *.img
+__pycache__/
+*.pyc
