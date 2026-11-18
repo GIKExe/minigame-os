@@ -9,10 +9,10 @@
 # Результат:
 #   out/kernel32.bin   - ядро protected mode (i386+)
 #   out/kernel64.bin   - ядро long mode (x86-64)
-#   out/bios.img       - El Torito boot image для BIOS
+#   out/bios.img       - BIOS payload (stage1 + ядра)
 #   out/BOOTX64.EFI    - UEFI-загрузчик (PE32+)
-#   out/efi.img        - FAT16-образ с EFI/BOOT/BOOTX64.EFI
-#   out/usb.img        - образ для USB-флешки (MBR: BIOS + FAT16: UEFI)
+#   out/efi.img        - FAT16-образ с EFI/BOOT/BOOTX64.EFI (промежуточный)
+#   usb.img            - образ для USB-флешки (MBR: BIOS + FAT16: UEFI)
 
 import os
 import struct
@@ -39,12 +39,6 @@ STAGE1_RESERVE = 0x2000                 # байт под bios_stage1.bin
 LOAD_BASE = 0x7C00                      # El Torito грузит boot image сюда
 KERNEL32_ADDR = LOAD_BASE + STAGE1_RESERVE
 KERNEL64_ALIGN = 0x1000
-
-# FAT16-раздел для UEFI: 65535 секторов по 512 байт (~32 МиБ),
-# 64994 кластера. Валидный FAT32 требует >= 65525 кластеров, поэтому
-# для такого размера используется FAT16: на нём том монтируют EDK2,
-# Windows и Linux.
-EFI_IMG_SECTORS = 0xFFFF
 
 ENABLE_64 = True
 
@@ -227,32 +221,7 @@ run([
 patch_pe_section(UEFI_EFI, ".kernel", 0xE0500020)
 verify_pe(UEFI_EFI)
 
-# 8. FAT16-образ для UEFI
-#
-# -F (FAT32) здесь использовать нельзя: при 65535 секторах по 512 байт
-# получается 64994 кластера, а FAT32 по спецификации начинается с 65525.
-# EDK2 FatPkg в таком случае возвращает EFI_VOLUME_CORRUPTED, Windows
-# определяет тип по числу кластеров и тоже не монтирует том. FAT16 с
-# 64994 кластерами (< 65525) — валидный том для всех трёх реализаций.
-efi_size = EFI_IMG_SECTORS * 512
-print(f"[*] Создание FAT16 ({efi_size} bytes)...")
-write_file(EFI_IMG, b"\x00" * efi_size)
-run([
-    "wsl", "mformat", "-i", wsl_path(EFI_IMG),
-    "-T", str(EFI_IMG_SECTORS), "-h", "64", "-s", "32", "-c", "1",
-    "-v", "EFIBOOT", "::",
-], "Форматирование FAT16")
-
-run(["wsl", "mmd", "-i", wsl_path(EFI_IMG), "::/EFI", "::/EFI/BOOT"],
-    "Создание EFI/BOOT")
-run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(UEFI_EFI),
-     "::/EFI/BOOT/BOOTX64.EFI"], "Копирование BOOTX64.EFI")
-run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(KERNEL32_FILE),
-     "::/KERNEL32.BIN"], "Копирование KERNEL32.BIN")
-run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(KERNEL64_FILE),
-     "::/KERNEL64.BIN"], "Копирование KERNEL64.BIN")
-
-# 9. README на образе
+# 8. README на образе
 readme = """MiniGame OS
 ===========
 
@@ -266,6 +235,49 @@ Architecture: x86-64 (long mode) if supported by CPU,
 No BIOS calls in the game: direct VGA/GOP output and PS/2 input.
 """
 write_file(README_FILE, readme.encode("ascii"))
+
+# 9. FAT-образ для UEFI
+#
+# FAT16 минимально возможного размера: кластер 512 байт, корневой каталог
+# 16 секторов (256 записей), 4096 кластеров. Меньше нельзя - при числе
+# кластеров < 4085 том становится FAT12, а часть UEFI-прошивок FAT12 не
+# читает (образ с FAT12 на реальном железе не загрузился). 4096 кластеров -
+# первый размер, который по спецификации является FAT16.
+# Геометрия BPB (255 головок, 63 сектора) совпадает с MBR, чтобы CHS-поля
+# раздела и BPB не противоречили друг другу.
+FAT_CLUSTER_BYTES = 512
+ROOT_SECTORS = 16                       # mformat -r считает в секторах
+RESERVED_SECTORS = 1
+MIN_FAT16_CLUSTERS = 4096
+files_bytes = sum(os.path.getsize(p) for p in
+                  (UEFI_EFI, KERNEL32_FILE, KERNEL64_FILE, README_FILE))
+data_clusters = max(MIN_FAT16_CLUSTERS,
+                    (2 * files_bytes + FAT_CLUSTER_BYTES - 1) //
+                    FAT_CLUSTER_BYTES + 8)
+if data_clusters >= 65525:
+    print("[!] FAT16: слишком много кластеров", file=sys.stderr)
+    sys.exit(1)
+fat_sectors = (((data_clusters + 2) * 2) + 511) // 512
+EFI_IMG_SECTORS = (RESERVED_SECTORS + 2 * fat_sectors + ROOT_SECTORS +
+                   data_clusters)
+efi_size = EFI_IMG_SECTORS * 512
+print(f"[*] Создание FAT16 ({efi_size} байт, {data_clusters} кластеров, "
+      f"файлы {files_bytes} байт)...")
+write_file(EFI_IMG, b"\x00" * efi_size)
+run([
+    "wsl", "mformat", "-i", wsl_path(EFI_IMG),
+    "-T", str(EFI_IMG_SECTORS), "-h", "255", "-s", "63", "-c", "1",
+    "-r", str(ROOT_SECTORS), "-v", "EFIBOOT", "::",
+], "Форматирование FAT16")
+
+run(["wsl", "mmd", "-i", wsl_path(EFI_IMG), "::/EFI", "::/EFI/BOOT"],
+    "Создание EFI/BOOT")
+run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(UEFI_EFI),
+     "::/EFI/BOOT/BOOTX64.EFI"], "Копирование BOOTX64.EFI")
+run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(KERNEL32_FILE),
+     "::/KERNEL32.BIN"], "Копирование KERNEL32.BIN")
+run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(KERNEL64_FILE),
+     "::/KERNEL64.BIN"], "Копирование KERNEL64.BIN")
 run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(README_FILE),
      "::/README.TXT"], "Копирование README.TXT")
 
@@ -281,10 +293,10 @@ run(["wsl", "mcopy", "-o", "-i", wsl_path(EFI_IMG), wsl_path(README_FILE),
 #   LBA 2048..   - FAT16-раздел с EFI/BOOT/BOOTX64.EFI для UEFI.
 #
 # Один и тот же файл грузится и в legacy BIOS (через MBR), и в UEFI
-# (прошивка монтирует FAT16-раздел).
+# (прошивка монтирует FAT-раздел).
 USB_MBR_FILE = os.path.join(OUT_DIR, "usb_mbr.bin")
 USB_LOADER_FILE = os.path.join(OUT_DIR, "usb_loader.bin")
-USB_IMG = os.path.join(OUT_DIR, "usb.img")
+USB_IMG = "usb.img"
 USB_LOADER_LBA = 1
 USB_LOADER_SECTORS = 8
 USB_PAYLOAD_LBA = USB_LOADER_LBA + USB_LOADER_SECTORS
@@ -310,18 +322,33 @@ if len(loader) > USB_LOADER_SECTORS * 512:
     sys.exit(1)
 
 fat = bytearray(read_file(EFI_IMG))
-if fat[54:59] != b"FAT16":
-    print("[!] EFI.IMG: ожидался FAT16", file=sys.stderr)
+if fat[54:59] not in (b"FAT12", b"FAT16"):
+    print("[!] EFI.IMG: ожидался FAT12/FAT16", file=sys.stderr)
     sys.exit(1)
 # Скрытые сектора должны указывать на начало раздела - иначе часть
 # прошивок/утилит считает BPB несоответствующим разделу.
 struct.pack_into("<I", fat, 28, USB_FAT_LBA)
 
-# Один активный раздел (EFI System) с FAT16 для UEFI.
-# CHS посчитан для геометрии 255 головок / 63 сектора (LBA 2048..67582);
-# прошивки и утилиты используют LBA, CHS нужен только старым проверкам.
+# Один активный раздел с FAT16 для UEFI.
+#
+# Тип 0xEF (EFI System) - так размечен раздел в спецификации UEFI, и его
+# без вопросов принимают прошивки. Windows такие разделы в проводнике не
+# показывает, но для записи образа это не важно: файлы смотрите 7-Zip'ом.
+# UEFI-прошивка ищет \EFI\BOOT\BOOTX64.EFI на любом FAT-томе.
+#
+# CHS считается для геометрии 255 головок / 63 сектора; прошивки и ОС
+# используют LBA, но старые проверки смотрят и на CHS.
+def chs(lba, heads=255, spt=63):
+    cyl, rem = divmod(lba, heads * spt)
+    head, sec = divmod(rem, spt)
+    if cyl > 1023:
+        return b"\xFE\xFF\xFF"
+    return bytes((head, (sec + 1) | ((cyl >> 2) & 0xC0), cyl & 0xFF))
+
+USB_PART_TYPE = 0xEF
 struct.pack_into("<B3sB3sII", mbr, 0x1BE,
-                 0x80, b"\x20\x21\x00", 0xEF, b"\x34\x2F\x04",
+                 0x80, chs(USB_FAT_LBA), USB_PART_TYPE,
+                 chs(USB_FAT_LBA + EFI_IMG_SECTORS - 1),
                  USB_FAT_LBA, EFI_IMG_SECTORS)
 
 usb = bytearray((USB_FAT_LBA + EFI_IMG_SECTORS) * 512)
@@ -331,10 +358,12 @@ usb[USB_PAYLOAD_LBA * 512:USB_PAYLOAD_LBA * 512 + len(bios)] = bytes(bios)
 usb[USB_FAT_LBA * 512:] = fat
 write_file(USB_IMG, usb)
 print(f"[*] USB-образ: {len(usb)} байт, payload @ LBA {USB_PAYLOAD_LBA}, "
-      f"FAT16 @ LBA {USB_FAT_LBA}")
+      f"FAT @ LBA {USB_FAT_LBA}")
+print(f"    файлы: {files_bytes} байт, том: {efi_size} байт "
+      f"({efi_size / files_bytes:.2f}x)")
 
 # 11. Итог
 print(f"[+] Готово: {USB_IMG} ({len(usb)} байт)")
 print(f"    BIOS: LBA 0 (MBR) -> payload @ LBA {USB_PAYLOAD_LBA}")
-print(f"    UEFI: FAT16 @ LBA {USB_FAT_LBA}")
+print(f"    UEFI: FAT @ LBA {USB_FAT_LBA}")
 print(f"    запись: dd if={USB_IMG} of=/dev/sdX bs=4M  (или Rufus DD / Etcher)")

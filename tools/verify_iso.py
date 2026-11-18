@@ -45,12 +45,13 @@ def show_entry(label, e):
 
 
 def verify_fat(fat, size, expected):
-    """Проверка BPB и содержимого FAT16/FAT32-образа для UEFI.
+    """Проверка BPB и содержимого FAT12/FAT16/FAT32-образа для UEFI.
 
     Тип FAT определяется так же, как в EDK2 FatPkg и Windows: по
-    FatSz16/FatSz32 и числу кластеров. FAT32 обязан иметь не менее
-    65525 кластеров (0xFFF5), иначе EDK2 возвращает EFI_VOLUME_CORRUPTED,
-    а Windows считает том FAT16 и упирается в RootEntries = 0.
+    FatSz16/FatSz32 и числу кластеров. Меньше 4085 кластеров при
+    FatSz16 != 0 - FAT12, 4085..65524 - FAT16. FAT32 обязан иметь не
+    менее 65525 кластеров (0xFFF5), иначе EDK2 возвращает
+    EFI_VOLUME_CORRUPTED.
     """
     assert len(fat) == size
     bps = u16(fat, 11)
@@ -78,12 +79,13 @@ def verify_fat(fat, size, expected):
     assert clusters > 0, 'no data clusters'
 
     if fatsz16:
-        assert root_entries != 0, 'FAT16 root entry count must be non-zero'
+        assert root_entries != 0, 'FAT16/FAT12 root entry count must be non-zero'
         fat32 = False
-        # 4085..65524 кластеров — FAT16, меньше — FAT12.
-        assert 4085 <= clusters < 65525, f'{clusters} clusters is not FAT16'
-        fat_bits = 16
-        fat_type = 'FAT16'
+        if clusters < 4085:
+            fat_bits, fat_type = 12, 'FAT12'
+        else:
+            assert clusters < 65525, f'{clusters} clusters is not FAT16'
+            fat_bits, fat_type = 16, 'FAT16'
     else:
         assert fatsz32 != 0, 'no FAT size'
         assert root_entries == 0, 'FAT32 root entry count must be 0'
@@ -123,6 +125,11 @@ def verify_fat(fat, size, expected):
         if fat32:
             value = u32(fat, fat_start + cluster * 4) & 0x0FFFFFFF
             return None if value >= 0x0FFFFFF8 else value
+        if fat_bits == 12:
+            offset = fat_start + cluster + cluster // 2
+            value = u16(fat, offset)
+            value = (value >> 4) if (cluster & 1) else (value & 0x0FFF)
+            return None if value >= 0xFF8 else value
         value = u16(fat, fat_start + cluster * 2)
         return None if value >= 0xFFF8 else value
 

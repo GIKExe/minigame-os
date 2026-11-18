@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Статическая проверка out/usb.img без запуска эмулятора.
+"""Статическая проверка usb.img без запуска эмулятора.
 
 Проверяются:
-  * MBR: сигнатура, один активный раздел, его LBA/размер;
+  * MBR: сигнатура, один активный раздел, его LBA/размер, CHS;
   * второй этап загрузчика и bios.img на своих LBA;
-  * BPB FAT16 раздела, FAT[0]/FAT[1], скрытые сектора;
+  * BPB FAT-раздела, FAT[0]/FAT[1], скрытые сектора;
   * файлы внутри FAT-раздела (сверка с out/).
 
-Запуск: python tools/verify_usb.py out/usb.img
+Запуск: python tools/verify_usb.py usb.img
 """
 
 import os
@@ -41,9 +41,20 @@ def main(path):
     count = u32(entry, 12)
     print(f'MBR ok: active partition type 0x{ptype:02X}, '
           f'LBA {start}, {count} sectors')
-    assert ptype == 0xEF, f'unexpected partition type 0x{ptype:02X}'
+    assert ptype in (0x06, 0xEF), f'unexpected partition type 0x{ptype:02X}'
     assert start == FAT_LBA, f'partition starts at {start}, expected {FAT_LBA}'
     assert (start + count) * S == len(d), 'partition does not fill the image'
+
+    def chs_to_lba(e, off):
+        head = e[off]
+        sec = e[off + 1] & 0x3F
+        cyl = ((e[off + 1] & 0xC0) << 2) | e[off + 2]
+        return ((cyl * 255) + head) * 63 + (sec - 1)
+
+    assert chs_to_lba(entry, 1) == start, 'partition start CHS does not match LBA'
+    assert chs_to_lba(entry, 5) == start + count - 1, \
+        'partition end CHS does not match LBA'
+    print('MBR CHS ok: start/end match LBA fields')
 
     # ---- загрузчик и BIOS payload ----
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'out')
@@ -60,7 +71,7 @@ def main(path):
         'bios.img mismatch'
     print(f'bios.img ok: LBA {PAYLOAD_LBA}, {len(bios)} bytes')
 
-    # ---- FAT16 раздел ----
+    # ---- FAT-раздел ----
     fat = d[start * S:(start + count) * S]
     assert u32(fat, 28) == start, 'BPB hidden sectors must equal partition LBA'
 
@@ -75,4 +86,4 @@ def main(path):
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else os.path.join('out', 'usb.img')))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'usb.img'))
